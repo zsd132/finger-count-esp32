@@ -7,7 +7,21 @@ ROOT="$(cd .. && pwd)"
 
 export PLATFORMIO_CORE_DIR="${PLATFORMIO_CORE_DIR:-$ROOT/.platformio}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$ROOT/.cache}"
+
 PIO="$ROOT/.venv/bin/pio"
+if [ ! -x "$PIO" ]; then
+  if command -v pio >/dev/null 2>&1; then
+    PIO="$(command -v pio)"
+  elif [ -x "$ROOT/.venv/bin/pip" ]; then
+    echo "[setup] 未找到 PlatformIO，安装到项目 .venv（只需一次）..."
+    "$ROOT/.venv/bin/pip" install -q platformio
+    PIO="$ROOT/.venv/bin/pio"
+  else
+    echo "错误：没有找到 PlatformIO，也没有 .venv。"
+    echo "请先按 README 执行：python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt"
+    exit 1
+  fi
+fi
 
 PORT="${1:-}"
 if [ -z "$PORT" ]; then

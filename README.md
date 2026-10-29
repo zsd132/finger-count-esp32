@@ -1,324 +1,558 @@
-# 摄像头手指计数（YOLO + 21 关键点）
+# 手指计数：摄像头 + YOLO + ESP32 OLED
 
-对着摄像头比出 **0~5** 根手指，屏幕上实时显示数字。核心是 **YOLO11n-pose 手部 21 关键点模型** + 一套纯几何的判指算法，不需要自己标注数据、不需要训练。
+用电脑摄像头识别你伸出的手指数量（0~5），实时显示在屏幕上；可选通过 USB 串口把数字发给 **ESP32**，在 **0.96 寸 OLED** 上显示，并用 **GPIO17** 输出一个开关量。
 
 ![demo](docs/demo.jpg)
 
-> 📘 完整原理、串口协议、换权重、自建数据集训练：[`docs/完整技术文档.md`](docs/完整技术文档.md)
-
-> 上图是实际运行截图：绿线是伸长的手指，灰线是弯曲的手指，左上角是总数。
-
----
-
-## 一、先说结论：为什么不是“YOLO 直接分类 0~5”
-
-我按你的要求先翻了 GitHub 上的同类项目（stars 为查询时数据）：
-
-| 项目 | Stars | 做法 | 借鉴价值 |
-|---|---:|---|---|
-| [CMU-Perceptual-Computing-Lab/openpose](https://github.com/CMU-Perceptual-Computing-Lab/openpose) | 34.5k | 人体/手部关键点 | 关键点路线的鼻祖，但太重 |
-| [cvzone/cvzone](https://github.com/cvzone/cvzone) | 1.3k | MediaPipe + `fingersUp()` | 手指计数最常用的工程封装 |
-| [Kazuhito00/hand-gesture-recognition-using-mediapipe](https://github.com/Kazuhito00/hand-gesture-recognition-using-mediapipe) | 770 | MediaPipe + 小型 MLP 分类手势 | 关键点 + 分类器的经典组合 |
-| [chrismuntean/YOLO11n-pose-hands](https://github.com/chrismuntean/YOLO11n-pose-hands) | 99 | **YOLO11n-pose 手部 21 关键点** | 本项目的模型来源 |
-| [jaredvasquez/CNN-HowManyFingers](https://github.com/jaredvasquez/CNN-HowManyFingers) | 49 | CNN 直接分类 0~5 | 需要采集/标注大量数据 |
-| [paveldat/finger_counter](https://github.com/paveldat/finger_counter) | 26 | OpenCV 凸包缺陷 | 只在纯色背景下稳 |
-
-**结论：**
-
-1. “YOLO 目标检测 + 手指计数”这类仓库几乎没有高星的（搜到的都在 3 star 以下），因为它们只能框出整只手，**框本身不含“伸了几根手指”的信息**。
-2. 高星方案走的是 **关键点（landmark）** 路线：先拿到 21 个手部关节点，再用几何规则或小分类器判断每根手指的状态。
-3. 所以最合理的做法是：**YOLO 负责“手在哪 + 21 个关键点”，我们写算法把关键点翻译成 0~5**。这样既用上了 YOLO，又不用训练分类器，泛化也够用。
-
-我还额外做了一个 **MediaPipe 后备引擎**。原因很现实：这个 YOLO 模型是在“手充满画面”的数据集上训练的，手离镜头远、背景杂乱时会漏检；MediaPipe 对这类场景更稳。默认的 `auto` 模式会**逐帧**判断：YOLO 检到手就用 YOLO 的关键点，某一帧完全没检到就临时交给 MediaPipe 补上，两个引擎共用同一套判指算法。
+<p>
+  <img alt="python" src="https://img.shields.io/badge/python-3.10--3.12-blue">
+  <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey">
+  <img alt="esp32" src="https://img.shields.io/badge/MCU-ESP32-red">
+</p>
 
 ---
 
-## 二、整体流程
+## 目录
 
-```
-摄像头 1280x720
-   │
-   ├─ 镜像翻转（像照镜子）
-   │
-   ├─ ① YOLO11n-pose 检测手部框 + 21 关键点（640）
-   │      └─ ② 裁出手部区域放大后再跑一次，关键点更准（两段式）
-   │
-   ├─ ③ 几何判指：每根手指“伸直 / 弯曲”
-   │      拇指：关节角度 + 指尖离食指根部的距离
-   │      其余四指：PIP/DIP 关节角度 + 指尖相对掌心的伸出量
-   │
-   ├─ ④ 时序平滑：9 帧多数投票，单帧抖动不会改数字
-   │
-   └─ ⑤ 绘制：骨架、高亮伸出的手指、左上角大数字、FPS
-```
-
-关键点编号采用 MediaPipe 标准（0=手腕，1-4 拇指，5-8 食指，9-12 中指，13-16 无名指，17-20 小指），YOLO 模型输出的顺序与此一致。
-
-### 判指规则（`src/counting.py`）
-
-对食指/中指/无名指/小指：
-
-- 关节角度：PIP、DIP 两处夹角都 ≥ 145°（手指是直的，而不是折回来）；
-- 伸出量：指尖沿“手腕→中指根”方向，比 PIP 关节更远 ≥ 8% 掌长。
-
-对拇指：
-
-- MCP、IP 两处夹角 ≥ 135°，并且指尖到食指根部的距离 ≥ 0.62 掌宽（或横向伸出 ≥ 0.55 掌宽）。
-
-全部用 **像素坐标 + 掌宽/掌长归一化**，所以旋转、缩放、手心/手背朝向都不影响结果；单元测试覆盖了旋转、镜像、缩放、握拳、比 2/3/5 等情况。
-
-阈值不是拍脑袋定的：用 HaGRID 的 837 个真实手部关键点做了网格搜索，把几何规则的计数准确率从 **79.2% 提到 84.5%**（拇指从 79.8% 提到 85.7%）。
-
-另外训练了一个 **5 指逻辑回归分类器**（`models/finger_lr.npz`，10 维特征、5 个模型，共几 KB）：
-在 HaGRID 验证集上计数准确率 **87%**，拇指 **92%**。它只在 **MediaPipe 引擎**下启用，因为训练数据就是 MediaPipe 关键点；YOLO 关键点分布不同，套用反而会变差（实测过）。
+- [0. 这个仓库能做什么](#0-这个仓库能做什么)
+- [1. 准备清单](#1-准备清单)
+- [2. 从零复现（macOS / Linux）](#2-从零复现macos--linux)
+- [3. Windows 复现](#3-windows-复现)
+- [4. 使用说明](#4-使用说明)
+- [5. 接 ESP32 + OLED](#5-接-esp32--oled)
+- [6. 常见问题](#6-常见问题)
+- [7. 项目结构](#7-项目结构)
+- [8. 它是怎么识别的](#8-它是怎么识别的)
+- [9. 换权重 / 自己训练](#9-换权重--自己训练)
+- [10. 性能](#10-性能)
+- [11. 文档与致谢](#11-文档与致谢)
 
 ---
 
-## 三、快速开始
+## 0. 这个仓库能做什么
 
-环境：macOS（本项目在 macOS 14.8 + Intel x86_64 + Python 3.10 上验证）、Python 3.10 / 3.11 / 3.12（3.13 暂时没有 torch 2.2.2 的安装包）、有摄像头。
+- **0~5 手指计数**：YOLO11n-pose 手部 21 关键点，或 MediaPipe 关键点；
+- **两段式推理**：先检测手，再裁出手部放大跑第二遍，显著提升小目标精度；
+- **判指**：几何规则（四指 + 拇指单独规则），MediaPipe 模式下还会用学习型分类器；
+- **防抖**：9 帧多数投票 + 0.5 秒保持 + 丢失 0.6 秒保持，数字不乱跳；
+- **屏幕 HUD**：骨架高亮、大数字、左右手标签、FPS；
+- **串口**：`FC <总数> <手数> [数字[:L|R]]`，断线自动重连；
+- **ESP32**：OLED 显示大数字 + L/R 徽标，GPIO17 在数字为 5 时输出高电平。
+
+> 仓库**不包含**第三方 YOLO 权重和 HaGRID 数据（许可证/体积原因）。
+> 第一次运行前执行 `python tools/download_models.py`，脚本会自动下载并校验。
+
+---
+
+## 1. 准备清单
+
+### 硬件
+
+| 必需 | 说明 |
+|---|---|
+| 电脑 | macOS / Linux / Windows |
+| 摄像头 | 笔记本内置即可，或用 USB 摄像头 |
+
+| 可选（显示到单片机） | 说明 |
+|---|---|
+| ESP32 开发板 | 经典 ESP32-WROOM-32 即可（本项目在 ESP32-D0WD-V3 上验证） |
+| 0.96 寸 OLED | SSD1306，128×64，I2C，4 针，地址 0x3C |
+| USB 数据线 | 能给 ESP32 供电并支持串口（不是纯充电线） |
+
+### 软件
+
+| 软件 | 版本 / 说明 |
+|---|---|
+| Python | **3.10 / 3.11 / 3.12**（3.13 可能没有 torch 2.2.2 轮子） |
+| Git | 任意新版本 |
+| PlatformIO | 只在烧 ESP32 固件时需要；`firmware/flash.sh` 会自动装 |
+
+---
+
+## 2. 从零复现（macOS / Linux）
+
+> 下面命令默认在终端里执行。macOS 用 `python3`；Linux 如果 `python3` 指向 3.13，请显式用 `python3.12`。
+
+### 2.1 克隆仓库
 
 ```bash
-cd ~/Desktop/yolo
+git clone https://github.com/zsd132/finger-count-esp32.git
+cd finger-count-esp32
+```
 
-# 方式 A：一键脚本（首次会自动建 venv、装依赖、下模型）
-./run.sh
+### 2.2 创建虚拟环境并安装依赖
 
-# 方式 B：手动
+```bash
+python3 --version          # 确认是 3.10 ~ 3.12
 python3 -m venv .venv
 source .venv/bin/activate
+
+python -m pip install -U pip
 pip install -r requirements.txt
+```
+
+依赖是固定版本的（Intel Mac / 通用平台兼容）：
+
+```
+torch 2.2.2 / torchvision 0.17.2
+mediapipe 0.10.21
+numpy 1.26.4
+opencv-contrib-python 4.10.0.84
+ultralytics 8.3.40
+pyserial 3.5
+```
+
+> Apple Silicon 也能用这套版本；如果 `mediapipe` 装不上，先确认 Python 是 3.11 或 3.12。
+
+### 2.3 下载手部关键点权重
+
+```bash
 python tools/download_models.py
+```
+
+预期输出：
+
+```
+model OK: .../models/yolo11n-pose-hands.pt (6.3 MB)
+mediapipe hand model OK
+```
+
+脚本会走 GitHub API 下载并校验 SHA-256，不依赖被墙的 `github.com` 网页。
+如果仍然失败，手动下载
+[`best.pt`](https://github.com/chrismuntean/YOLO11n-pose-hands/blob/main/runs/pose/train/weights/best.pt)
+保存为 `models/yolo11n-pose-hands.pt`。
+
+### 2.4 运行
+
+```bash
 python main.py
 ```
 
-首次运行 macOS 会弹“是否允许访问摄像头”，**必须点允许**。如果误点了拒绝：
-`系统设置 → 隐私与安全性 → 摄像头`，把你运行程序的 App（Terminal / PyCharm / iTerm）勾上，然后重启该 App。
+对着镜头比 0~5，窗口左上角显示数字。
 
-### 操作
+- 首次运行 macOS 会请求摄像头权限，**必须允许**；
+- 拒绝过就去 `系统设置 → 隐私与安全性 → 摄像头` 勾选 Terminal / VS Code，然后完全退出重开。
 
-| 按键 | 作用 |
-|---|---|
-| `q` / `Esc` | 退出 |
-| `s` | 截图到 `out/snapshot_*.jpg` |
-| `d` | 保存调试帧 + 关键点 JSON（数字不对时发给开发者） |
-| `m` | 切换镜像 |
-
-### 常用参数
+### 2.5 验证安装（不接摄像头也能测）
 
 ```bash
-python main.py --backend mediapipe      # 换 MediaPipe 引擎
-python main.py --no-refine              # 关掉第二段放大推理，速度快约一倍
-python main.py --max-hands 1            # 只检测一只手
-python main.py --camera-width 1920 --camera-height 1080
-python main.py --source 1               # 换一个摄像头
-python main.py --source samples/px_diva-plavalaguna-6937816.jpg   # 跑图片
-python main.py --source video.mp4 --headless --record out/demo.mp4  # 跑视频并录制
+# 19 个单元测试
+python -m unittest discover -s tests -v
+
+# 跑一张示例图，期望输出 counts=[5] total=5
+python main.py --source samples/px_diva-plavalaguna-6937816.jpg --headless
 ```
+
+成功后会在 `out/` 生成标注图。
+
+### 2.6 一键脚本（可选）
+
+macOS / Linux 可以直接：
+
+```bash
+chmod +x run.sh
+./run.sh
+```
+
+`run.sh` 会自动完成：建 venv → 装依赖 → 下模型 → 启动。
+
+macOS 也可以双击 `启动.command`（窗口不会自动关，日志在 `out/launcher.log`）。
+
+---
+
+## 3. Windows 复现
+
+`run.sh` / `flash.sh` 是 bash 脚本；Windows 用下面的命令即可（PowerShell）：
+
+```powershell
+git clone https://github.com/zsd132/finger-count-esp32.git
+cd finger-count-esp32
+
+py -3.12 -m venv .venv
+.venv\Scripts\Activate.ps1
+
+python -m pip install -U pip
+pip install -r requirements.txt
+python tools\download_models.py
+python main.py
+```
+
+- 摄像头一般是 `--source 0`，多摄像头试 `--source 1`；
+- 串口是 `COM3` / `COM4` 这种，用 `python main.py --list-serial` 查；
+- 没有 `run.sh`、`启动.command`，用上面的命令；
+- 固件烧录建议装 VS Code 的 **PlatformIO IDE** 扩展（见 5.2）。
+
+---
+
+## 4. 使用说明
+
+### 4.1 常用命令
+
+```bash
+# 摄像头 + 屏幕
+python main.py
+
+# 摄像头 + 串口 + 左右手图标（推荐）
+python main.py --serial auto --backend mediapipe
+
+# 只用 YOLO
+python main.py --serial auto --backend yolo
+
+# 跑图片 / 视频
+python main.py --source samples/px_diva-plavalaguna-6937816.jpg --headless
+python main.py --source video.mp4 --headless --record out/demo.mp4
+
+# 列出串口
+python main.py --list-serial
+```
+
+### 4.2 参数
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--source` | `0` | 摄像头编号 / 视频 / 图片 |
-| `--backend` | `auto` | `auto` 以 YOLO 为主，某帧没检到手时自动用 MediaPipe 补 |
-| `--model` | `models/yolo11n-pose-hands.pt` | 权重路径 |
-| `--imgsz` | `640` | 第一段检测尺寸，调小更快但更容易漏检 |
-| `--conf` | `0.35` | 手部检测阈值，手远/光暗可降到 `0.2` |
+| `--backend` | `auto` | `auto` = YOLO 为主，某帧没检到手时自动用 MediaPipe 补；也可强制 `yolo` / `mediapipe` |
+| `--model` | `models/yolo11n-pose-hands.pt` | 换权重改这里 |
+| `--imgsz` | `640` | YOLO 第一段检测尺寸 |
+| `--conf` | `0.35` | 手部检测阈值，手远/暗可降到 `0.2` |
 | `--max-hands` | `2` | 最多几只手 |
-| `--hold` | `0.5` | 新数字要稳定多少秒才显示/发送（0 关闭） |
-| `--no-refine` | 关 | 关闭第二段“裁剪放大再推理” |
-| `--headless` | 关 | 不弹窗，终端打印（适合跑文件/服务器） |
-| `--serial` | 空 | 串口设备，如 `/dev/cu.usbmodem14201`，或 `auto` 自动找 |
-| `--serial-baud` | 115200 | 波特率（要和单片机一致） |
-| `--serial-hz` | 30 | 串口最大发送频率 |
-| `--list-serial` | - | 列出当前可用串口后退出 |
+| `--hold` | `0.5` | 新数字稳定多少秒才显示/发送（0 关闭） |
+| `--no-refine` | 关 | 关闭第二段裁剪放大（快一倍，精度下降） |
+| `--no-mirror` | 关 | 不镜像 |
+| `--serial` | 空 | 串口路径，或 `auto` |
+| `--serial-baud` | `115200` | 要和单片机一致 |
+| `--serial-hz` | `30` | 串口最大发送频率 |
+| `--headless` | 关 | 不弹窗（跑文件/服务器） |
+| `--record` | 空 | 录制标注后的视频 |
+| `--dump-dir` | 空 | 每隔 N 帧存调试图 |
+| `--list-serial` | - | 列出串口后退出 |
+
+### 4.3 按键
+
+| 键 | 作用 |
+|---|---|
+| `q` / `Esc` | 退出 |
+| `s` | 截图到 `out/snapshot_*.jpg` |
+| `d` | 保存调试图 + 关键点 JSON（数字不对时用） |
+| `m` | 切换镜像 |
+
+### 4.4 两个引擎怎么选
+
+| | YOLO | MediaPipe |
+|---|---|---|
+| 速度（Intel CPU） | ~5 FPS（两段式） | ~20–30 FPS |
+| 左右手 | ❌ 不输出 | ✅ L/R |
+| 判指 | 几何规则 | 几何规则 + 学习型分类器 |
+| 适用 | 想用 YOLO / 自定义权重 | 日常使用、要 L/R 图标 |
+
+**建议日常用 `--backend mediapipe`**；想研究 YOLO 或换自己的权重用 `--backend yolo`。
 
 ---
 
-## 四、性能实测（本机 Intel Mac）
+## 5. 接 ESP32 + OLED
 
-| 模式 | 单帧耗时 | 约 FPS |
-|---|---:|---:|
-| 两段式（默认，精度优先） | ~200 ms | ~5 |
-| `--no-refine`（单段） | ~95 ms | ~10 |
+### 5.1 接线
 
-两段式是精度关键：直接对 1280×720 整帧推理时，手只占一两百像素，关键点会“缩”在掌心；把检测框裁出来放大到 640 再跑一次，指尖位置会准很多（实测同一张图从 1 根变 5 根）。
+| OLED | ESP32（DevKit / WROOM-32） |
+|---|---|
+| VCC | **3V3** |
+| GND | **GND** |
+| SCL | **GPIO22** |
+| SDA | **GPIO21** |
 
-如果觉得卡：`python main.py --no-refine`，或者把 `--imgsz` 降到 `512`。数字本身有 9 帧平滑，5 FPS 下延迟约 0.4 秒，演示可接受。
+> 看模块丝印，不要按排列顺序猜。ESP32-C3/S3 默认 I2C 不同（常见 SDA=8、SCL=9），
+> 需要同时改 `firmware/src/main.cpp` 顶部的 `I2C_SDA` / `I2C_SCL` 和
+> `platformio.ini` 里的 `board`。
 
----
+### 5.2 烧录固件
 
-## 五、目录结构
-
-```
-yolo/
-├── main.py                 # 入口
-├── run.sh                  # 一键安装 + 启动
-├── requirements.txt
-├── models/
-│   ├── yolo11n-pose-hands.pt   # YOLO 手部关键点权重（6 MB）
-│   └── finger_lr.npz           # 学习型 5 指分类器（几 KB）
-├── firmware/                   # ESP32 + 0.96" OLED（PlatformIO，无需 Arduino IDE）
-│   ├── platformio.ini
-│   ├── src/main.cpp
-│   ├── flash.sh                # 一键编译 + 烧录
-│   └── README.md
-├── arduino/
-│   └── finger_count_receiver/  # 通用单片机接收示例（.ino）
-├── data/
-│   └── basic_export.csv        # HaGRID 关键点（训练用，20 MB）
-├── src/
-│   ├── counting.py         # 21 关键点 -> 0~5（几何规则 + 可选分类器）
-│   ├── features.py         # 每根手指的归一化特征（训练/推理共用）
-│   ├── finger_model.py     # 学习型 5 指分类器（models/finger_lr.npz）
-│   ├── backends.py         # YOLO / MediaPipe 两个引擎 + 两段式精修
-│   ├── tracking.py         # 多手跟踪 + 时序平滑
-│   ├── serial_link.py      # 串口输出（FC 帧协议）
-│   ├── draw.py             # 骨架、数字面板、状态条
-│   └── app.py              # 主循环、参数、摄像头/文件输入
-├── tools/
-│   ├── download_models.py     # 走 GitHub API 下模型（绕开被墙的 github.com）
-│   ├── eval_images.py         # 批量跑图片，输出计数
-│   └── train_finger_model.py  # 用 HaGRID 关键点训练判指分类器
-├── tests/test_counting.py  # 11 个单元测试
-├── samples/                # 示例图片 / 测试视频
-├── docs/
-│   ├── demo.jpg
-│   └── 完整技术文档.md     # 原理 / 协议 / 换权重 / 自建数据集训练
-└── out/                    # 截图 / 录制 / 调试图
-```
-
----
-
-## 六、常见问题
-
-**1. `OpenCV: not authorized to capture video` / 摄像头打不开**
-macOS 权限问题。用哪个 App 运行就给哪个 App 授权（Terminal、PyCharm、VS Code…），授权后**完全退出并重开**该 App。也确认没有被 Zoom/微信/OBS 占用。
-
-**2. 模型下载失败**
-`python tools/download_models.py` 走的是 GitHub API（`api.github.com`），不依赖被墙的 `github.com`。仍失败的话，手动下载
-<https://github.com/chrismuntean/YOLO11n-pose-hands/blob/main/runs/pose/train/weights/best.pt>
-保存为 `models/yolo11n-pose-hands.pt`。
-
-**3. 数字不准 / 乱跳 / 一直显示 0**
-- 手离镜头太远：手至少占画面高度的 1/3；
-- 光线太暗或逆光；
-- 试试 `--backend mediapipe` 对比（这个模式会用学习型分类器，拇指更稳）；
-- **按 `d` 保存调试图**（`out/debug_*.jpg` + `.json`），能看到骨架、每根手指的角度和概率，发我就能定位；
-- 打开逐帧调试图：`python main.py --dump-dir out/debug --dump-every 10`。
-
-**4. 为什么 YOLO 有时漏检？**
-这个 6 MB 的 nano 模型训练集以“手充满画面”的图片为主（作者 README 也说明捏合、滑动等手势不稳）。它擅长“手举在镜头前”，不擅长“手在远处的小目标”。要更稳可以换更大的 `yolo11s-pose` 手部模型重训，或直接用 MediaPipe。
-
-**5. 想识别左右手？**
-MediaPipe 引擎会给出 `Left/Right` 并显示“左手/右手”；YOLO 模型只有一个 `hand` 类，暂不区分。
-
----
-
-## 七、把数字通过串口发给单片机
-
-可以，已经内置。识别结果会以 ASCII 行发给单片机，**只在数字变化时发送**，另外每秒补一帧心跳（断线/丢帧后单片机能自己恢复显示）。
-
-### 接线
-
-- 大多数开发板（Arduino Uno/Leonardo、ESP32、STM32 带 USB CDC、STC 下载器）**一根 USB 线直连电脑**即可，不需要额外杜邦线。
-- 如果用 UART 引脚（TX/RX）接 USB-TTL：记得 **共地（GND）**，逻辑电平要匹配（3.3V 单片机不要直接接 5V TTL 输出）。
-- 不要接真正的 RS-232 电平（±12V），会烧板子。
-
-### 使用
+**方式 A：一条命令（macOS / Linux）**
 
 ```bash
-# 1. 先看电脑认到了哪个串口（插上板子后）
-./run.sh --list-serial
-
-# 2. 指定串口运行（macOS 选 /dev/cu.*）
-./run.sh --serial /dev/cu.usbmodem14201
-
-# 或者让程序自己找（推荐；换 USB 口、热插拔后会自动重新查找）
-./run.sh --serial auto
+cd firmware
+chmod +x flash.sh
+./flash.sh
 ```
 
-> 换 USB 口后 macOS 可能把设备名从 `usbserial-1420` 改成 `usbserial-1410` 之类。
-> 用 `--serial auto` 就不用改命令；写死端口名的话，换口后要重新 `--list-serial` 确认。
+脚本会：
 
-连接成功后，画面左下角状态条会多一个 `SER` 标记，OLED 右上角会显示左右手徽标。
+1. 自动找 USB 串口（也可以 `./flash.sh /dev/cu.usbserial-1420` 指定）；
+2. 检查 PlatformIO，没有就装到项目 `.venv`；
+3. 第一次会下载 ESP32 工具链（几百 MB，几分钟）；
+4. 以 115200 波特率烧录。
 
-**防抖：** 新数字要连续稳定 `--hold` 秒（默认 0.5）才会显示和发送；手短暂丢失 0.6 秒内保持上一个数字，不会闪 0。觉得反应慢可以 `--hold 0.3`，想更稳就 `--hold 0.8`。
+> 烧录失败时：关掉 Arduino IDE / 串口监视器 / 正在运行的本项目；按住 BOOT 再点上传；
+> 换一根能传数据的 USB 线。
 
-终端会打印：
+**方式 B：VS Code 的 PlatformIO 扩展**
 
+1. VS Code 扩展商店搜 **PlatformIO IDE** 安装；
+2. 打开 `firmware/` 文件夹；
+3. 点底部 **Upload**（→ 图标）；
+4. 需要看日志点 **Serial Monitor**（115200）。
+
+**Windows**：用方式 B；或者 `pip install platformio` 后：
+
+```powershell
+cd firmware
+pio run -t upload --upload-port COM3
 ```
-[serial] 已连接 /dev/cu.usbmodem14201 @ 115200 8N1
-[serial] 等待单片机启动 1.5s …
+
+### 5.3 运行
+
+```bash
+cd ..            # 回到项目根目录
+python main.py --serial auto --backend mediapipe
 ```
 
-（Arduino Uno 打开串口会自动复位，所以特意留了 1.5 秒。）
+- 屏幕左下角出现 `SER` 表示串口已连接；
+- OLED 显示大数字，右上角显示 L / R / ?；
+- 电脑端 3 秒没发数据，OLED 左上角变 `NO LINK`。
 
-### 协议
+串口设备名：
+
+| 系统 | 名称 |
+|---|---|
+| macOS | `/dev/cu.usbserial-*`、`/dev/cu.usbmodem*` |
+| Linux | `/dev/ttyUSB*`、`/dev/ttyACM*` |
+| Windows | `COM3`、`COM4` … |
+
+用 `--serial auto` 就不用手改；换 USB 口后程序也会自动重新查找。
+
+### 5.4 串口协议
 
 ASCII、`115200 8N1`、一行一帧、`\n` 结尾：
 
 ```
-FC <total> <n_hands> [count_1[:L|R] count_2[:L|R] ...]
+FC <总数> <手数> [<手指数>[:L|R] ...]
 ```
 
-| 场景 | 实际发送 |
+| 场景 | 发送内容 |
 |---|---|
+| 连接成功 | `FC READY` |
 | 没检测到手 | `FC 0 0` |
-| 右手，3 根 | `FC 3 1 3:R` |
-| 两只手，2 + 3 根 | `FC 5 2 2:L 3:R` |
-| 左右手未知（YOLO 引擎） | `FC 4 1 4` |
+| 右手 3 根 | `FC 3 1 3:R` |
+| 两只手 2+3 根 | `FC 5 2 2:L 3:R` |
+| 左右手未知（YOLO） | `FC 4 1 4` |
 
-> `L`/`R` 来自 MediaPipe 的手性判断，YOLO 权重只输出关键点、不输出左右手。
-> 想要 OLED 上的 L/R 徽标，请用 `--backend mediapipe`。
+- 只在数字变化时发送，另外每秒补一帧心跳；
+- 最大 30 帧/秒；
+- 断线每 2 秒重连。
 
-单片机端解析（Arduino）：
+### 5.5 GPIO17 输出
 
-```cpp
-int total, hands;
-if (sscanf(line + 3, "%d %d", &total, &hands) == 2) {
-  // total 就是手指总数
-}
+| 手指数量 | GPIO17 |
+|---|---|
+| **5** | **高电平 3.3V** |
+| 0~4 | 低电平 0V |
+| 上电/复位 | 低电平 |
+| 串口断线 | 保持最后状态 |
+
+接线示例：
+
+```
+LED：  GPIO17 ── 330Ω ── LED ── GND
+继电器：GPIO17 ── 模块 IN；模块 VCC/GND 另接；共地
 ```
 
-完整示例：
-- ESP32 + 0.96" OLED（**推荐，不需要 Arduino IDE**）：[`firmware/`](firmware/README.md)
-- 通用 Arduino 接收示例：[`arduino/finger_count_receiver/finger_count_receiver.ino`](arduino/finger_count_receiver/finger_count_receiver.ino)
+> GPIO 是 3.3V、约 12mA，**不能直接驱动继电器线圈/电机**，要经三极管/光耦/模块。
+> 驱动继电器、电磁锁、电机、舵机、220V 负载的完整方法见
+> [`docs/完整技术文档.md`](docs/完整技术文档.md) 第 12 章。
 
-ESP32 的接线是 `VCC→3V3、GND→GND、SCL→GPIO22、SDA→GPIO21`，插上板子后运行 `firmware/flash.sh` 即可编译烧录。
+### 5.6 OLED 布局
 
-### 没有硬件时怎么测
-
-```bash
-# loop:// 是 pyserial 的虚拟串口，写进去的数据直接丢弃，用来验证不报错
-./run.sh --serial loop:// --headless --source samples/px_diva-plavalaguna-6937816.jpg
 ```
-
-想看到真实字节，可以用 `screen` 或 Arduino IDE 的串口监视器（**同一时间只能有一个程序占用串口**，跑本程序前先关掉监视器）：
-
-```bash
-screen /dev/cu.usbmodem14201 115200
+┌────────────────────────┐
+│ FINGERS           [L]  │
+│          5             │
+└────────────────────────┘
 ```
-
-### 常见问题
-
-- **打不开串口 / Permission denied**：先关掉 Arduino IDE 的串口监视器、其他串口工具；macOS 选 `/dev/cu.*` 而不是 `/dev/tty.*`。
-- **单片机收到乱码**：两边波特率不一致，或选了错误的口。程序默认 115200，用 `--serial-baud 9600` 可改。
-- **数字不动**：只在变化时发送 + 每秒心跳，属正常；可以看终端有没有 `SER` 和串口日志。
-- **51 单片机**：把 `Serial.begin(115200)` 改成你的晶振支持的波特率（如 9600），电脑端加 `--serial-baud 9600`。
 
 ---
 
-## 八、可以继续做的方向
+## 6. 常见问题
 
-1. **手势命令**：把 0~5 映射成播放/暂停、音量、PPT 翻页（加一个“手势稳定 500ms 才触发”即可）。
-2. **双手合计**：现在已支持两只手，左上角显示总和；也可以改成两只手分别显示。
-3. **自定义训练**：用 `ultralytics` 把自己的手部数据（或 0~5 分类数据）微调，替换 `models/*.pt`。
-4. **打包成 App**：`py2app` / `PyInstaller`，免去终端和 Python 环境。
+### Q1. `pip install` 卡住 / 装不上 torch 或 mediapipe
+
+- 确认 Python 是 **3.10~3.12**（`python3 --version`）；3.13 换 3.12；
+- 国内网络慢可以先换源：
+  `pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple`
+- Apple Silicon 装不上 mediapipe 时，优先用 Python 3.11。
+
+### Q2. 模型下载失败
+
+`python tools/download_models.py` 走 `api.github.com`；如果失败：
+
+1. 浏览器打开
+   <https://github.com/chrismuntean/YOLO11n-pose-hands/blob/main/runs/pose/train/weights/best.pt>
+2. 下载后保存为 `models/yolo11n-pose-hands.pt`；
+3. 重新运行 `python main.py`。
+
+### Q3. MediaPipe 首次运行报错 / 下载模型失败
+
+MediaPipe 需要访问 `storage.googleapis.com`。如果被墙：
+
+```bash
+python main.py --backend yolo
+```
+
+YOLO 模式不依赖 MediaPipe（只是没有 L/R 图标）。
+
+### Q4. 摄像头打不开 / `not authorized`
+
+- macOS：`系统设置 → 隐私与安全性 → 摄像头`，勾选 Terminal / VS Code / PyCharm，然后**完全退出重开**；
+- 确认没有被 Zoom / 微信 / OBS 占用；
+- 多摄像头试 `--source 1`。
+
+### Q5. 串口打不开 / `Resource busy`
+
+- 关掉 Arduino IDE 的串口监视器、其他串口工具（串口独占）；
+- macOS 用 `/dev/cu.*`，不要 `/dev/tty.*`；
+- `python main.py --list-serial` 确认名字；
+- 换 USB 口后名字可能变，用 `--serial auto`。
+
+### Q6. OLED 不亮 / 花屏
+
+- 检查 3V3、GND、SCL=22、SDA=21；
+- 少数模块地址是 0x3D：在 `firmware/src/main.cpp` 里
+  `display.setI2CAddress(0x3D << 1);`
+- 花屏/偏移可能是 SH1106 屏：把构造函数换成
+  `U8G2_SH1106_128X64_NONAME_F_HW_I2C`；
+- 杜邦线长时把 `Wire.setClock(400000L)` 改成 `100000L`。
+
+### Q7. OLED 显示 `?` 而不是 L/R
+
+YOLO 权重不输出左右手。用 `--backend mediapipe`。
+
+### Q8. 数字变化慢 / 一直不变
+
+- 这是 `--hold 0.5` 的防抖设计，改 `--hold 0.2` 或 `0`；
+- 数字一直 0：手离镜头太远/太暗，或 `--conf` 太高（试 `0.2`）；
+- 按 `d` 保存调试图，看 `out/debug_*.json` 里的角度和概率。
+
+### Q9. 固件上传失败
+
+- 关掉占用串口的程序；
+- 按 BOOT 再点上传；
+- 上传速度已设为 115200（`platformio.ini`），不要改回 921600；
+- 换 USB 线/口。
+
+### Q10. 仓库里为什么没有 `models/*.pt` 和 `data/basic_export.csv`
+
+- 权重是第三方模型、原仓库没有明确许可证，公开仓库不直接分发；`download_models.py` 会下载；
+- `basic_export.csv` 是 HaGRID 派生数据，只在重训判指分类器时需要，`data/README.md` 有下载地址。
 
 ---
 
-## 九、致谢与说明
+## 7. 项目结构
 
-- 权重来自 [chrismuntean/YOLO11n-pose-hands](https://github.com/chrismuntean/YOLO11n-pose-hands)，训练数据为 Rion Dsilva 的 *Hand Keypoint Dataset 26K*；仓库未声明开源许可证，**仅供学习/个人演示**，商用前请自行确认授权。
-- 示例图片来自 [cj-mills/pexel-hand-gesture-test-images](https://huggingface.co/datasets/cj-mills/pexel-hand-gesture-test-images)（Pexels）。
-- 本项目代码可自由修改使用。
+```
+finger-count-esp32/
+├── main.py                 # 入口
+├── run.sh                  # 一键：建 venv / 装依赖 / 下模型 / 启动
+├── 启动.command             # macOS 双击启动
+├── requirements.txt
+│
+├── src/
+│   ├── app.py              # 主循环、参数、摄像头/文件/串口
+│   ├── backends.py         # YOLO / MediaPipe / auto 回退 + 两段式精修
+│   ├── counting.py         # 21 关键点 → 每指伸/屈
+│   ├── features.py         # 每指 10 维归一化特征
+│   ├── finger_model.py     # 学习型 5 指分类器
+│   ├── tracking.py         # 多手跟踪 + 多数投票 + 0.5s 保持
+│   ├── serial_link.py      # 串口协议、心跳、重连
+│   └── draw.py             # 骨架 / 数字面板 / 状态条
+│
+├── models/
+│   └── finger_lr.npz       # 判指分类器（YOLO 权重需下载）
+│
+├── firmware/               # ESP32 工程（PlatformIO）
+│   ├── platformio.ini
+│   ├── src/main.cpp        # 串口解析 + OLED + GPIO17
+│   ├── flash.sh            # 一键编译烧录
+│   └── README.md
+│
+├── arduino/                # 通用 Arduino 接收示例
+├── tools/
+│   ├── download_models.py
+│   ├── eval_images.py
+│   └── train_finger_model.py
+├── data/README.md          # 训练数据下载说明
+├── tests/                  # 19 个单元测试
+├── samples/                # 示例图片
+├── docs/
+│   ├── demo.jpg
+│   └── 完整技术文档.md
+└── out/                    # 运行时输出（git 忽略）
+```
+
+---
+
+## 8. 它是怎么识别的
+
+1. **读帧 + 镜像**：摄像头 1280×720，水平翻转；
+2. **检测 + 21 关键点**：YOLO11n-pose（两段式：整帧检测 → 裁手放大再推理）或 MediaPipe；
+3. **判指**：
+   - 四指：PIP/DIP 关节角度 ≥135°，且指尖沿掌轴比 PIP 更远；
+   - 拇指：MCP/IP 角度 ≥125°，且指尖离食指根 ≥1.0 掌宽或横向伸出 ≥0.9 掌宽；
+   - MediaPipe 模式还可用 5 个逻辑回归分类器（HaGRID 数据训练，计数 86.9%、拇指 92.3%）；
+4. **防抖**：9 帧多数投票 → 0.5 秒保持 → 丢失 0.6 秒保持；
+5. **输出**：屏幕 HUD + 串口 `FC ...` → ESP32 → OLED + GPIO17。
+
+完整公式、阈值、原理、协议细节见
+👉 **[docs/完整技术文档.md](docs/完整技术文档.md)**。
+
+---
+
+## 9. 换权重 / 自己训练
+
+### 换权重
+
+```bash
+python main.py --model models/my_hand_pose.pt
+```
+
+新权重必须：`task=pose`、`kpt_shape=[21,3]`、21 个关键点顺序与 MediaPipe 一致。
+检查：
+
+```bash
+python - <<'PY'
+from ultralytics import YOLO
+m = YOLO("models/my_hand_pose.pt")
+print(m.task, m.names, m.model.kpt_shape)
+PY
+```
+
+### 用自己的数据训练
+
+- **路线 A：微调 YOLO 关键点模型**（采集 → 标 21 点 → YOLO pose 格式 → 训练 → 替换）；
+- **路线 B：只训练判指分类器**（只要 0~5 类别标签，几分钟搞定，推荐先做）。
+
+两条路线的完整步骤、标注格式、`data.yaml`、训练命令、常见坑：
+👉 **技术文档第 7、8 章**。
+
+---
+
+## 10. 性能
+
+Intel Mac、纯 CPU 实测：
+
+| 模式 | 单帧 | FPS |
+|---|---:|---:|
+| YOLO 两段式 | ~200 ms | ~5 |
+| YOLO `--no-refine` | ~95 ms | ~10 |
+| MediaPipe | ~30–50 ms | ~20–30 |
+
+体感延迟主要来自 `--hold 0.5` 的防抖，不是模型。
+
+---
+
+## 11. 文档与致谢
+
+- 完整技术文档：[`docs/完整技术文档.md`](docs/完整技术文档.md)（1400+ 行：原理、协议、换权重、训练、GPIO 驱动外部设备）
+- 手部关键点权重：[chrismuntean/YOLO11n-pose-hands](https://github.com/chrismuntean/YOLO11n-pose-hands)
+  （训练数据为 *Hand Keypoint Dataset 26K*；仓库未声明许可证，**仅供学习/个人演示，商用前自行确认授权**）
+- 判指分类器训练数据：[HaGRID 关键点导出](https://huggingface.co/datasets/GestureDetectionConnoisseurs/preprocessed_hand_skeletons)
+- 示例图片：[cj-mills/pexel-hand-gesture-test-images](https://huggingface.co/datasets/cj-mills/pexel-hand-gesture-test-images)（Pexels）
+
+本项目代码可自由修改使用。
