@@ -1,0 +1,11 @@
+.venv/
+out/
+__pycache__/
+*.pyc
+.DS_Store
+models/*.onnx
+.platformio/
+.cache/
+firmware/.pio/
+models/*.pt
+data/*.csv
